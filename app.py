@@ -1,5 +1,5 @@
 from Config.Config import app, db
-from Config.Models import User  # Keep only the necessary models
+from Models.Models import User 
 
 from Routes.Matrix.MatrixApi import matrix_routes
 from Routes.Geocoding.GeocodingApi import geocoding_routes
@@ -12,7 +12,7 @@ import time
 import threading
 import os
 import faulthandler
-from flask import request, jsonify, g
+from flask import request, jsonify, g, Blueprint
 
 # === LOGGING SETUP ===
 LOG_DIR = '/tmp'
@@ -62,9 +62,7 @@ def log_memory_usage(interval=60):
 
 threading.Thread(target=log_memory_usage, daemon=True).start()
 
-# === ROUTES EXAMPLE ===
-from flask import Blueprint
-
+# === ROUTES ===
 user_routes = Blueprint('users', __name__)
 
 @user_routes.route('/login', methods=['POST'])
@@ -77,15 +75,27 @@ app.register_blueprint(geocoding_routes, url_prefix='/api/geocoding')
 app.register_blueprint(isochrone_routes, url_prefix='/api/isochrone')
 app.register_blueprint(directions_routes, url_prefix='/api/directions')
 
-# === DB INIT ===
+# === DATABASE INITIALIZATION ===
 with app.app_context():
-    try:
-        db.create_all()
-        logging.info("Database initialized successfully.")
-    except Exception as e:
-        logging.error(f"Database connection failed: {e}")
+    metadata = db.Model.metadata
+    inspector = db.inspect(db.engine)
+    existing_tables = inspector.get_table_names()
 
-# === APP RUN ===
+    defined_tables = metadata.tables.keys()
+    missing_tables = [t for t in defined_tables if t not in existing_tables]
+
+    if missing_tables:
+        logging.info(f"Missing tables detected: {missing_tables}. Creating missing tables...")
+        try:
+            db.create_all()
+            logging.info("Tables created successfully.")
+        except Exception as e:
+            logging.error(f"Error creating tables: {e}")
+    else:
+        logging.info("All tables exist. No creation needed.")
+
+
+# === RUN APP ===
 if __name__ == "__main__":
-    logging.info("Application started")
+    logging.info("Application starting up...")
     app.run(host='0.0.0.0', port=8000, debug=True)
