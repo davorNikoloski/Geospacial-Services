@@ -91,3 +91,4 @@ def calculate_matrix():
         logging.error(f"Matrix calculation error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
+ 
