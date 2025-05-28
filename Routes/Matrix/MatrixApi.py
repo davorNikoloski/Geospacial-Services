@@ -1,21 +1,25 @@
 from flask import jsonify, request
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt_identity
 import time
 import logging
 from Config.Config import app
 from flask import Blueprint
+from Utils.usageTracker import track_usage
 
 # Import all required functions from matrix.py
 from Services.MatrixServices import (
-
     calculate_optimal_route
 )
 
 # === MATRIX CALCULATION ROUTES ===
 matrix_routes = Blueprint('matrix', __name__)
 
+# Define API ID (should match what's in your database)
+MATRIX_API_ID = 2  # Change this to your actual API ID
+
 @matrix_routes.route('/calculate', methods=['POST'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=MATRIX_API_ID, endpoint_name='calculate_matrix')
 def calculate_matrix():
     try:
         start_total = time.time()
@@ -90,5 +94,3 @@ def calculate_matrix():
     except Exception as e:
         logging.error(f"Matrix calculation error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
-
- 

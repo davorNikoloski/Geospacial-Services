@@ -1,5 +1,5 @@
 from flask import jsonify, request
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt_identity
 import time
 import logging
 from Config.Config import app
@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 from functools import wraps
 import os
+from Utils.usageTracker import track_usage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +27,9 @@ from Services.IsochroneServices import (
 
 # Initialize routes blueprint
 isochrone_routes = Blueprint('isochrone', __name__)
+
+# Define API ID (should match what's in your database)
+ISOCHRONE_API_ID = 4  # Change this to your actual API ID
 
 # Thread pool for parallel processing
 executor = ThreadPoolExecutor(max_workers=4)
@@ -58,7 +62,8 @@ def validate_travel_times(travel_times):
     return True, ""
 
 @isochrone_routes.route('/calculate', methods=['POST'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='calculate_isochrone')
 @async_route
 def get_isochrones():
     """
@@ -144,7 +149,8 @@ def get_isochrones():
         return jsonify({'error': 'Internal server error'}), 500
 
 @isochrone_routes.route('/geojson', methods=['POST'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='isochrone_geojson')
 @async_route
 def get_isochrones_geojson():
     """
@@ -223,7 +229,8 @@ def get_isochrones_geojson():
         return jsonify({'error': 'Internal server error'}), 500
 
 @isochrone_routes.route('/compare', methods=['POST'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='compare_isochrones')
 @async_route
 def compare_isochrones():
     """
@@ -350,7 +357,8 @@ def compare_isochrones():
         return jsonify({'error': 'Internal server error'}), 500
 
 @isochrone_routes.route('/stats', methods=['POST'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='isochrone_stats')
 @async_route
 def get_isochrone_stats():
     """
@@ -449,7 +457,8 @@ def get_isochrone_stats():
         return jsonify({'error': 'Internal server error'}), 500
 
 @isochrone_routes.route('/batch', methods=['POST'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='batch_isochrones')
 @async_route
 def batch_isochrones():
     """
@@ -574,7 +583,8 @@ def batch_isochrones():
         return jsonify({'error': 'Internal server error'}), 500
 
 @isochrone_routes.route('/cache/status', methods=['GET'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='cache_status')
 def get_cache_status():
     """Get current cache status and statistics"""
     try:
@@ -610,7 +620,8 @@ def get_cache_status():
         return jsonify({'error': 'Internal server error'}), 500
 
 @isochrone_routes.route('/cache/clear', methods=['POST'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='clear_cache')
 def clear_cache():
     """Clear cache (memory and/or disk)"""
     try:
@@ -643,7 +654,8 @@ def clear_cache():
         return jsonify({'error': 'Internal server error'}), 500
 
 @isochrone_routes.route('/preload', methods=['POST'])
-#@jwt_required()
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='preload_graphs')
 def preload_graphs():
     """Preload graphs for specified locations"""
     try:

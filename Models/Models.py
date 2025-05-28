@@ -1,6 +1,6 @@
 from Config.Config import db
 from datetime import datetime
-from sqlalchemy import Numeric  # FIX: Import Numeric for decimal columns
+from sqlalchemy import Numeric
 
 class User(db.Model):
     __tablename__ = 'users'
@@ -14,6 +14,7 @@ class User(db.Model):
     country = db.Column('country', db.String(100), nullable=True)
     created_at = db.Column('created_at', db.DateTime, default=datetime.utcnow)
     modified_at = db.Column('modified_at', db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_admin = db.Column('is_admin', db.Boolean, default=False)
 
     # Relationships
     api_keys = db.relationship('UserApiKey', backref='user', lazy=True)
@@ -22,7 +23,6 @@ class User(db.Model):
 
     def __repr__(self):
         return f'<User {self.username}>'
-
 
 class Api(db.Model):
     __tablename__ = 'apis'
@@ -39,7 +39,6 @@ class Api(db.Model):
 
     def __repr__(self):
         return f'<Api {self.name}>'
-
 
 class UserApiKey(db.Model):
     __tablename__ = 'user_api_keys'
@@ -59,7 +58,6 @@ class UserApiKey(db.Model):
     def __repr__(self):
         return f'<UserApiKey {self.api_key[:8]}...>'
 
-
 class UserApiKeyPermission(db.Model):
     __tablename__ = 'user_api_key_permissions'
 
@@ -71,7 +69,6 @@ class UserApiKeyPermission(db.Model):
     def __repr__(self):
         return f'<UserApiKeyPermission {self.api_key_id}:{self.api_id}>'
 
-
 class ApiUsage(db.Model):
     __tablename__ = 'api_usage'
 
@@ -80,7 +77,9 @@ class ApiUsage(db.Model):
     api_id = db.Column('api_id', db.Integer, db.ForeignKey('apis.id'), nullable=False)
     api_key_id = db.Column('api_key_id', db.Integer, db.ForeignKey('user_api_keys.id'), nullable=False)
     timestamp = db.Column('timestamp', db.DateTime, default=datetime.utcnow)
-    endpoint = db.Column('endpoint', db.String(255), nullable=True)
+    endpoint = db.Column('endpoint', db.String
+
+(255), nullable=True)
     response_time = db.Column('response_time', db.Float, nullable=True)
     status_code = db.Column('status_code', db.Integer, nullable=True)
     ip_address = db.Column('ip_address', db.String(50), nullable=True)
@@ -95,7 +94,6 @@ class ApiUsage(db.Model):
 
     def __repr__(self):
         return f'<ApiUsage {self.user_id}:{self.api_id} at {self.timestamp}>'
-
 
 class ApiAnalytics(db.Model):
     __tablename__ = 'api_analytics'

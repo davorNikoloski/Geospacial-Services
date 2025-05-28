@@ -1,577 +1,730 @@
 from flask import jsonify, request
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt_identity
 import time
 import logging
 from Config.Config import app
 from flask import Blueprint
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+from functools import wraps
+import os
+from Utils.usageTracker import track_usage
 
-# Import directions service functions
-from Services.DirectionsServices import (
-    get_route_directions,
-    get_simple_route,
-    validate_transport_mode
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import optimized isochrone service functions
+from Services.IsochroneServices import (
+    calculate_isochrone,
+    convert_polygons_to_geojson,
+    get_bounding_box,
+    get_stats_for_isochrones,
+    preload_popular_areas,
+    cleanup_old_cache,
+    graph_cache
 )
 
-# Import matrix service functions for PDP
-from Services.MatrixServices import calculate_optimal_route
+# Initialize routes blueprint
+isochrone_routes = Blueprint('isochrone', __name__)
 
-# === DIRECTIONS ROUTES ===
-directions_routes = Blueprint('directions', __name__)
+# Define API ID (should match what's in your database)
+ISOCHRONE_API_ID = 5  # Change this to your actual API ID
 
-@directions_routes.route('/route', methods=['POST'])
-#@jwt_required()
-def calculate_route():
+# Thread pool for parallel processing
+executor = ThreadPoolExecutor(max_workers=4)
+
+def async_route(f):
+    """Decorator to make route handler async-capable"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        return f(*args, **kwargs)
+    return decorated_function
+
+def validate_coordinates(lat, lon):
+    """Validate latitude and longitude values"""
+    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        return False, "Coordinates must be numbers"
+    if not -90 <= lat <= 90:
+        return False, "Latitude must be between -90 and 90"
+    if not -180 <= lon <= 180:
+        return False, "Longitude must be between -180 and 180"
+    return True, ""
+
+def validate_travel_times(travel_times):
+    """Validate travel times array"""
+    if not isinstance(travel_times, list) or not travel_times:
+        return False, "travel_times must be a non-empty list"
+    if len(travel_times) > 10:
+        return False, "Maximum 10 travel times allowed"
+    if any(not isinstance(t, (int, float)) or t <= 0 or t > 120 for t in travel_times):
+        return False, "Travel times must be positive numbers ≤ 120 minutes"
+    return True, ""
+
+@isochrone_routes.route('/calculate', methods=['POST'])
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='calculate_isochrone')
+@async_route
+def get_isochrones():
     """
-    Calculate route with multiple waypoints and optional optimization
-    Request body: {
-        "waypoints": [
-            {"lat": 41.1230977, "lng": 20.8016481},
-            {"lat": 41.9981, "lng": 21.4325},
-            {"lat": 41.9981, "lng": 21.4654}
-        ],
-        "transport_mode": "driving",  // Optional: driving, foot, bike (default: driving)
-        "optimize_route": false,      // Optional: whether to optimize waypoint order
-        "use_osmnx_fallback": false,  // Optional: use OSMnx if OSRM fails
-        "route_type": "shortest"      // Optional: for optimization
+    Calculate isochrones (travel time polygons) from a starting point
+    
+    Example request:
+    {
+        "latitude": 40.7128,
+        "longitude": -74.0060,
+        "travel_times": [5, 10, 15],
+        "travel_mode": "drive"
     }
     """
     try:
         start_total = time.time()
         data = request.get_json()
         
-        # Validate request
-        if not data or 'waypoints' not in data:
+        if not data:
+            return jsonify({'error': 'Invalid JSON data'}), 400
+        
+        # Validate required fields
+        required_fields = ['latitude', 'longitude']
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
             return jsonify({
-                'error': 'Invalid request format. Required field: waypoints',
-                'example': {
-                    'waypoints': [
-                        {'lat': 41.123, 'lng': 20.801},
-                        {'lat': 41.234, 'lng': 20.902}
-                    ],
-                    'transport_mode': 'driving'  # Optional: driving, foot, bike
-                }
+                'error': f'Missing required fields: {", ".join(missing_fields)}'
             }), 400
             
-        waypoints = data['waypoints']
-        transport_mode = data.get('transport_mode', 'driving')
+        # Extract and validate coordinates
+        latitude = data['latitude']
+        longitude = data['longitude']
+        valid, error_msg = validate_coordinates(latitude, longitude)
+        if not valid:
+            return jsonify({'error': error_msg}), 400
+            
+        # Get optional parameters with defaults
+        travel_times = data.get('travel_times', [5, 10, 15])
+        travel_mode = data.get('travel_mode', 'drive')
+        simplify_tolerance = data.get('simplify_tolerance', 20)
         
-        # Validate waypoints
-        if not waypoints or len(waypoints) < 2:
+        # Validate travel mode
+        valid_modes = ['drive', 'walk', 'bike']
+        if travel_mode not in valid_modes:
             return jsonify({
-                'error': 'At least 2 waypoints are required'
+                'error': f'Invalid travel mode. Must be one of: {", ".join(valid_modes)}'
             }), 400
             
-        # Validate waypoint structure
-        for i, wp in enumerate(waypoints):
-            if not isinstance(wp, dict) or 'lat' not in wp or 'lng' not in wp:
-                return jsonify({
-                    'error': f'Waypoint {i} must have "lat" and "lng" fields',
-                    'received': wp
-                }), 400
+        # Validate travel times
+        valid, error_msg = validate_travel_times(travel_times)
+        if not valid:
+            return jsonify({'error': error_msg}), 400
             
-            # Validate coordinate values
-            try:
-                lat = float(wp['lat'])
-                lng = float(wp['lng'])
-                if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
-                    return jsonify({
-                        'error': f'Waypoint {i} has invalid coordinates. Lat: [-90,90], Lng: [-180,180]',
-                        'received': {'lat': lat, 'lng': lng}
-                    }), 400
-            except (ValueError, TypeError):
-                return jsonify({
-                    'error': f'Waypoint {i} coordinates must be numeric',
-                    'received': wp
-                }), 400
-        
-        # Validate transport mode
-        try:
-            validated_mode = validate_transport_mode(transport_mode)
-            data['transport_mode'] = validated_mode
-        except ValueError as e:
-            return jsonify({
-                'error': str(e),
-                'supported_modes': ['driving', 'foot', 'bike'],
-                'aliases': {
-                    'driving': ['car', 'drive', 'auto'],
-                    'foot': ['walk', 'walking', 'pedestrian'],
-                    'bike': ['cycle', 'cycling', 'bicycle']
-                }
-            }), 400
-        
-        # Get route calculation result
-        result = get_route_directions(data)
-        
-        if result.get('status') == 'error':
-            return jsonify(result), 400
+        # Validate simplify tolerance
+        if not isinstance(simplify_tolerance, (int, float)) or simplify_tolerance < 0:
+            return jsonify({'error': 'simplify_tolerance must be a non-negative number'}), 400
             
-        # Add API processing time to response
-        result['api_processing_time_seconds'] = time.time() - start_total
-        return jsonify(result), 200
+        # Calculate isochrones
+        isochrone_result = calculate_isochrone(
+            latitude,
+            longitude,
+            travel_times=travel_times,
+            travel_mode=travel_mode,
+            simplify_tolerance=simplify_tolerance
+        )
+        
+        if 'error' in isochrone_result:
+            return jsonify(isochrone_result), 500
+            
+        # Add total processing time
+        total_time = time.time() - start_total
+        isochrone_result['total_processing_time_seconds'] = round(total_time, 3)
+        
+        # Add cache info
+        isochrone_result['cache_info'] = {
+            'memory_graphs': len(graph_cache.memory_cache),
+            'cache_hits': 'N/A'  # Could implement hit counter
+        }
+        
+        return jsonify(isochrone_result), 200
         
     except Exception as e:
-        logging.error(f"Directions API error: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Internal server error: {str(e)}',
-            'api_processing_time_seconds': time.time() - start_total
-        }), 500
+        logging.error(f"Isochrone API error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
-@directions_routes.route('/route_pdp', methods=['POST'])
-#@jwt_required()
-def calculate_route_pdp():
+@isochrone_routes.route('/geojson', methods=['POST'])
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='isochrone_geojson')
+@async_route
+def get_isochrones_geojson():
     """
-    Calculate route for Pickup Delivery Problem (PDP)
-    Request body: {
-        "current_location": {
-            "latitude": 41.1230977,
-            "longitude": 20.8016481
-        },
+    Calculate isochrones and return as GeoJSON format for mapping
+    """
+    try:
+        start_total = time.time()
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Invalid JSON data'}), 400
+        
+        # Validate required fields
+        required_fields = ['latitude', 'longitude']
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            return jsonify({
+                'error': f'Missing required fields: {", ".join(missing_fields)}'
+            }), 400
+            
+        # Extract and validate coordinates
+        latitude = data['latitude']
+        longitude = data['longitude']
+        valid, error_msg = validate_coordinates(latitude, longitude)
+        if not valid:
+            return jsonify({'error': error_msg}), 400
+            
+        # Get optional parameters with defaults
+        travel_times = data.get('travel_times', [5, 10, 15])
+        travel_mode = data.get('travel_mode', 'drive')
+        simplify_tolerance = data.get('simplify_tolerance', 20)
+        
+        # Validate parameters
+        valid_modes = ['drive', 'walk', 'bike']
+        if travel_mode not in valid_modes:
+            return jsonify({
+                'error': f'Invalid travel mode. Must be one of: {", ".join(valid_modes)}'
+            }), 400
+            
+        valid, error_msg = validate_travel_times(travel_times)
+        if not valid:
+            return jsonify({'error': error_msg}), 400
+            
+        # Calculate isochrones
+        isochrone_result = calculate_isochrone(
+            latitude,
+            longitude,
+            travel_times=travel_times,
+            travel_mode=travel_mode,
+            simplify_tolerance=simplify_tolerance
+        )
+        
+        if 'error' in isochrone_result:
+            return jsonify(isochrone_result), 500
+            
+        # Convert to GeoJSON
+        geojson = convert_polygons_to_geojson(isochrone_result)
+        
+        if not geojson:
+            return jsonify({'error': 'Failed to generate GeoJSON'}), 500
+            
+        # Add metadata
+        geojson['processing_time_seconds'] = round(time.time() - start_total, 3)
+        geojson['bounds'] = get_bounding_box(isochrone_result)
+        geojson['center'] = isochrone_result['center']
+        geojson['travel_mode'] = travel_mode
+        geojson['graph_info'] = {
+            'nodes': isochrone_result.get('graph_nodes', 0),
+            'edges': isochrone_result.get('graph_edges', 0)
+        }
+        
+        return jsonify(geojson), 200
+        
+    except Exception as e:
+        logging.error(f"Isochrone GeoJSON API error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+@isochrone_routes.route('/compare', methods=['POST'])
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='compare_isochrones')
+@async_route
+def compare_isochrones():
+    """
+    Compare isochrones for different travel modes using parallel processing
+    
+    Example request:
+    {
+        "latitude": 40.7128,
+        "longitude": -74.0060,
+        "travel_time": 15,
+        "travel_modes": ["drive", "walk", "bike"]
+    }
+    """
+    try:
+        start_total = time.time()
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Invalid JSON data'}), 400
+        
+        # Validate required fields
+        required_fields = ['latitude', 'longitude', 'travel_time']
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            return jsonify({
+                'error': f'Missing required fields: {", ".join(missing_fields)}'
+            }), 400
+            
+        # Extract and validate coordinates
+        latitude = data['latitude']
+        longitude = data['longitude']
+        valid, error_msg = validate_coordinates(latitude, longitude)
+        if not valid:
+            return jsonify({'error': error_msg}), 400
+            
+        # Get travel modes and time
+        travel_modes = data.get('travel_modes', ['drive', 'walk', 'bike'])
+        travel_time = data.get('travel_time', 15)
+        simplify_tolerance = data.get('simplify_tolerance', 20)
+        
+        # Validate travel time
+        if not isinstance(travel_time, (int, float)) or travel_time <= 0 or travel_time > 120:
+            return jsonify({'error': 'travel_time must be a positive number ≤ 120 minutes'}), 400
+        
+        # Validate travel modes
+        valid_modes = ['drive', 'walk', 'bike']
+        invalid_modes = [mode for mode in travel_modes if mode not in valid_modes]
+        if invalid_modes:
+            return jsonify({
+                'error': f'Invalid travel modes: {", ".join(invalid_modes)}. Must be: {", ".join(valid_modes)}'
+            }), 400
+        
+        if len(travel_modes) > 3:
+            return jsonify({'error': 'Maximum 3 travel modes allowed'}), 400
+        
+        # Calculate isochrones for each mode in parallel
+        def calculate_for_mode(mode):
+            return mode, calculate_isochrone(
+                latitude,
+                longitude,
+                travel_times=[travel_time],
+                travel_mode=mode,
+                simplify_tolerance=simplify_tolerance
+            )
+        
+        # Use thread pool for parallel calculation
+        comparison = {
+            'center': {'latitude': latitude, 'longitude': longitude},
+            'travel_time_minutes': travel_time,
+            'comparisons': {},
+            'summary': {}
+        }
+        
+        # Execute calculations in parallel
+        future_to_mode = {
+            executor.submit(calculate_for_mode, mode): mode 
+            for mode in travel_modes
+        }
+        
+        for future in as_completed(future_to_mode, timeout=60):
+            try:
+                mode, isochrone_result = future.result()
+                
+                if 'error' in isochrone_result:
+                    comparison['comparisons'][mode] = {'error': isochrone_result['error']}
+                    continue
+                    
+                if isochrone_result['isochrones']:
+                    iso = isochrone_result['isochrones'][0]
+                    comparison['comparisons'][mode] = {
+                        'area_km2': iso['area_km2'],
+                        'polygon_coordinates': iso['polygon_coordinates'],
+                        'reachable_nodes': iso.get('reachable_nodes', 0),
+                        'processing_time_seconds': isochrone_result.get('processing_time_seconds', 0)
+                    }
+                else:
+                    comparison['comparisons'][mode] = {'error': 'No isochrone generated'}
+                    
+            except Exception as e:
+                mode = future_to_mode[future]
+                comparison['comparisons'][mode] = {'error': str(e)}
+        
+        # Calculate summary statistics
+        areas = []
+        for mode, data in comparison['comparisons'].items():
+            if 'area_km2' in data:
+                areas.append((mode, data['area_km2']))
+        
+        if areas:
+            areas.sort(key=lambda x: x[1], reverse=True)
+            comparison['summary'] = {
+                'largest_area': {'mode': areas[0][0], 'area_km2': areas[0][1]},
+                'smallest_area': {'mode': areas[-1][0], 'area_km2': areas[-1][1]},
+                'area_ratio_largest_to_smallest': round(areas[0][1] / areas[-1][1], 2) if areas[-1][1] > 0 else None
+            }
+        
+        # Add processing time
+        comparison['total_processing_time_seconds'] = round(time.time() - start_total, 3)
+        
+        return jsonify(comparison), 200
+        
+    except Exception as e:
+        logging.error(f"Isochrone comparison API error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+@isochrone_routes.route('/stats', methods=['POST'])
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='isochrone_stats')
+@async_route
+def get_isochrone_stats():
+    """
+    Get detailed statistics about isochrones
+    """
+    try:
+        start_total = time.time()
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Invalid JSON data'}), 400
+        
+        # Validate required fields
+        required_fields = ['latitude', 'longitude']
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            return jsonify({
+                'error': f'Missing required fields: {", ".join(missing_fields)}'
+            }), 400
+            
+        # Extract and validate coordinates
+        latitude = data['latitude']
+        longitude = data['longitude']
+        valid, error_msg = validate_coordinates(latitude, longitude)
+        if not valid:
+            return jsonify({'error': error_msg}), 400
+            
+        # Get optional parameters
+        travel_times = data.get('travel_times', [5, 10, 15])
+        travel_mode = data.get('travel_mode', 'drive')
+        
+        # Validate parameters
+        valid_modes = ['drive', 'walk', 'bike']
+        if travel_mode not in valid_modes:
+            return jsonify({
+                'error': f'Invalid travel mode. Must be one of: {", ".join(valid_modes)}'
+            }), 400
+            
+        valid, error_msg = validate_travel_times(travel_times)
+        if not valid:
+            return jsonify({'error': error_msg}), 400
+        
+        # Calculate isochrones
+        isochrone_result = calculate_isochrone(
+            latitude,
+            longitude,
+            travel_times=travel_times,
+            travel_mode=travel_mode
+        )
+        
+        if 'error' in isochrone_result:
+            return jsonify(isochrone_result), 500
+            
+        # Get statistics
+        stats = get_stats_for_isochrones(isochrone_result)
+        
+        # Create enhanced response
+        response = {
+            'center': isochrone_result['center'],
+            'travel_mode': travel_mode,
+            'bounds': get_bounding_box(isochrone_result),
+            'statistics': stats,
+            'graph_info': {
+                'total_nodes': isochrone_result.get('graph_nodes', 0),
+                'total_edges': isochrone_result.get('graph_edges', 0),
+                'network_density': round(
+                    isochrone_result.get('graph_edges', 0) / max(isochrone_result.get('graph_nodes', 1), 1), 
+                    3
+                )
+            },
+            'processing_info': {
+                'calculation_time_seconds': isochrone_result.get('processing_time_seconds', 0),
+                'total_time_seconds': round(time.time() - start_total, 3)
+            }
+        }
+        
+        # Add area growth analysis
+        if len(stats) > 1:
+            area_growth = []
+            for i in range(1, len(stats)):
+                prev_area = stats[i-1]['area_km2']
+                curr_area = stats[i]['area_km2']
+                growth_rate = ((curr_area - prev_area) / prev_area * 100) if prev_area > 0 else 0
+                area_growth.append({
+                    'from_minutes': stats[i-1]['travel_time_minutes'],
+                    'to_minutes': stats[i]['travel_time_minutes'],
+                    'area_increase_km2': round(curr_area - prev_area, 2),
+                    'growth_rate_percent': round(growth_rate, 1)
+                })
+            response['area_growth_analysis'] = area_growth
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        logging.error(f"Isochrone stats API error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+@isochrone_routes.route('/batch', methods=['POST'])
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='batch_isochrones')
+@async_route
+def batch_isochrones():
+    """
+    Calculate isochrones for multiple locations in parallel
+    
+    Example request:
+    {
         "locations": [
-            {
-                "latitude": 41.9981,
-                "longitude": 21.4325,
-                "type": "pickup",
-                "location_id": "pickup_1",
-                "package_id": "pkg_001"  // Optional
-            },
-            {
-                "latitude": 41.9981,
-                "longitude": 21.4654,
-                "type": "delivery",
-                "location_id": "delivery_1",
-                "package_id": "pkg_001"  // Optional
-            }
+            {"latitude": 40.7128, "longitude": -74.0060, "name": "NYC"},
+            {"latitude": 34.0522, "longitude": -118.2437, "name": "LA"}
         ],
-        "transport_mode": "driving"  // Optional: driving, foot, bike (default: driving)
+        "travel_times": [10, 20],
+        "travel_mode": "drive"
     }
     """
     try:
         start_total = time.time()
         data = request.get_json()
         
-        # Validate request structure
-        required_fields = ['current_location', 'locations']
-        if not data or not all(field in data for field in required_fields):
-            return jsonify({
-                'error': 'Invalid request format. Required fields: current_location, locations',
-                'example': {
-                    'current_location': {'latitude': 41.123, 'longitude': 20.801},
-                    'locations': [
-                        {
-                            'latitude': 41.234,
-                            'longitude': 20.902,
-                            'type': 'pickup',
-                            'location_id': 'pickup_1',
-                            'package_id': 'pkg_001'
-                        },
-                        {
-                            'latitude': 41.345,
-                            'longitude': 21.003,
-                            'type': 'delivery',
-                            'location_id': 'delivery_1',
-                            'package_id': 'pkg_001'
-                        }
-                    ],
-                    'transport_mode': 'driving'
-                }
-            }), 400
-
-        current_location = data['current_location']
-        locations = data['locations']
-        transport_mode = data.get('transport_mode', 'driving')
-
-        # Validate current_location
-        if not isinstance(current_location, dict) or 'latitude' not in current_location or 'longitude' not in current_location:
-            return jsonify({
-                'error': 'current_location must contain latitude and longitude fields',
-                'received': current_location
-            }), 400
-
-        # Validate current_location coordinates
-        try:
-            curr_lat = float(current_location['latitude'])
-            curr_lng = float(current_location['longitude'])
-            if not (-90 <= curr_lat <= 90) or not (-180 <= curr_lng <= 180):
-                return jsonify({
-                    'error': 'current_location has invalid coordinates. Lat: [-90,90], Lng: [-180,180]',
-                    'received': {'latitude': curr_lat, 'longitude': curr_lng}
-                }), 400
-        except (ValueError, TypeError):
-            return jsonify({
-                'error': 'current_location coordinates must be numeric',
-                'received': current_location
-            }), 400
-
-        # Validate locations array
-        if not locations or len(locations) < 2:
-            return jsonify({
-                'error': 'At least 2 locations (pickup and delivery pairs) are required for PDP'
-            }), 400
-
-        # Validate each location in PDP mode
-        valid_types = ['pickup', 'delivery']
+        if not data:
+            return jsonify({'error': 'Invalid JSON data'}), 400
+        
+        # Validate locations
+        locations = data.get('locations', [])
+        if not isinstance(locations, list) or not locations:
+            return jsonify({'error': 'locations must be a non-empty list'}), 400
+        
+        if len(locations) > 10:
+            return jsonify({'error': 'Maximum 10 locations allowed'}), 400
+        
+        # Validate each location
         for i, loc in enumerate(locations):
-            # Check required fields
-            required_loc_fields = ['latitude', 'longitude', 'type', 'location_id']
-            if not all(field in loc for field in required_loc_fields):
-                return jsonify({
-                    'error': f'Location {i} must contain: latitude, longitude, type, location_id',
-                    'received': loc,
-                    'missing_fields': [field for field in required_loc_fields if field not in loc]
-                }), 400
+            if not isinstance(loc, dict):
+                return jsonify({'error': f'Location {i} must be an object'}), 400
+            if 'latitude' not in loc or 'longitude' not in loc:
+                return jsonify({'error': f'Location {i} missing latitude or longitude'}), 400
             
-            # Validate coordinates
+            valid, error_msg = validate_coordinates(loc['latitude'], loc['longitude'])
+            if not valid:
+                return jsonify({'error': f'Location {i}: {error_msg}'}), 400
+        
+        # Get common parameters
+        travel_times = data.get('travel_times', [5, 10, 15])
+        travel_mode = data.get('travel_mode', 'drive')
+        
+        # Validate parameters
+        valid_modes = ['drive', 'walk', 'bike']
+        if travel_mode not in valid_modes:
+            return jsonify({
+                'error': f'Invalid travel mode. Must be one of: {", ".join(valid_modes)}'
+            }), 400
+            
+        valid, error_msg = validate_travel_times(travel_times)
+        if not valid:
+            return jsonify({'error': error_msg}), 400
+        
+        # Calculate isochrones for each location in parallel
+        def calculate_for_location(loc, index):
             try:
-                lat = float(loc['latitude'])
-                lng = float(loc['longitude'])
-                if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
-                    return jsonify({
-                        'error': f'Location {i} has invalid coordinates. Lat: [-90,90], Lng: [-180,180]',
-                        'received': {'latitude': lat, 'longitude': lng}
-                    }), 400
-            except (ValueError, TypeError):
-                return jsonify({
-                    'error': f'Location {i} coordinates must be numeric',
-                    'received': {'latitude': loc.get('latitude'), 'longitude': loc.get('longitude')}
-                }), 400
-            
-            # Validate type
-            if loc['type'] not in valid_types:
-                return jsonify({
-                    'error': f'Location {i} has invalid type. Must be one of: {valid_types}',
-                    'received': loc['type']
-                }), 400
-            
-            # Validate location_id
-            if not isinstance(loc['location_id'], (str, int)) or not str(loc['location_id']).strip():
-                return jsonify({
-                    'error': f'Location {i} must have valid location_id (non-empty string or number)',
-                    'received': loc.get('location_id')
-                }), 400
-
-        # Validate transport mode
-        try:
-            validated_mode = validate_transport_mode(transport_mode)
-        except ValueError as e:
-            return jsonify({
-                'error': str(e),
-                'supported_modes': ['driving', 'foot', 'bike'],
-                'aliases': {
-                    'driving': ['car', 'drive', 'auto'],
-                    'foot': ['walk', 'walking', 'pedestrian'],
-                    'bike': ['cycle', 'cycling', 'bicycle']
+                result = calculate_isochrone(
+                    loc['latitude'],
+                    loc['longitude'],
+                    travel_times=travel_times,
+                    travel_mode=travel_mode
+                )
+                result['location_index'] = index
+                result['location_name'] = loc.get('name', f'Location {index}')
+                return result
+            except Exception as e:
+                return {
+                    'location_index': index,
+                    'location_name': loc.get('name', f'Location {index}'),
+                    'error': str(e)
                 }
-            }), 400
-
-        # Check for pickup-delivery pairs (basic validation)
-        pickup_count = sum(1 for loc in locations if loc['type'] == 'pickup')
-        delivery_count = sum(1 for loc in locations if loc['type'] == 'delivery')
         
-        if pickup_count == 0:
-            return jsonify({
-                'error': 'At least one pickup location is required for PDP'
-            }), 400
-        
-        if delivery_count == 0:
-            return jsonify({
-                'error': 'At least one delivery location is required for PDP'
-            }), 400
-
-        # Prepare data for matrix calculation
-        matrix_request_data = {
-            'locations': locations,
-            'pdp': True,  # Enable PDP mode
-            'current_location': current_location
+        # Execute calculations in parallel
+        future_to_location = {
+            executor.submit(calculate_for_location, loc, i): i 
+            for i, loc in enumerate(locations)
         }
-
-        print(f"\n=== Starting PDP Route Calculation ===")
-        print(f"Current location: {current_location}")
-        print(f"Transport mode: {validated_mode}")
-        print(f"Pickup locations: {pickup_count}")
-        print(f"Delivery locations: {delivery_count}")
-        print(f"Total locations: {len(locations)}")
-
-        # Prepare locations for matrix calculation (including current location)
-        matrix_locations = []
         
-        # Add current location
-        matrix_locations.append({
-            'id': 'current',
-            'lat': current_location['latitude'],
-            'lng': current_location['longitude'],
-            'type': 'current'
-        })
+        results = []
+        for future in as_completed(future_to_location, timeout=120):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                location_index = future_to_location[future]
+                results.append({
+                    'location_index': location_index,
+                    'location_name': locations[location_index].get('name', f'Location {location_index}'),
+                    'error': str(e)
+                })
         
-        # Add all other locations
-        for loc in locations:
-            matrix_locations.append({
-                'id': loc['location_id'],
-                'lat': loc['latitude'],
-                'lng': loc['longitude'],
-                'type': loc['type'],
-                'package_id': loc.get('package_id')
-            })
-
-        # Step 1: Calculate optimal route order using matrix calculation
-        print(f"Step 1: Calculating optimal PDP route order...")
-        optimal_result = calculate_optimal_route(matrix_locations)
-
-        if not optimal_result or 'error' in optimal_result:
-            return jsonify({
-                'status': 'error',
-                'message': optimal_result.get('error', 'Failed to calculate optimal PDP route'),
-                'transport_mode': validated_mode,
-                'api_processing_time_seconds': time.time() - start_total
-            }), 500
-
-        # Step 2: Extract optimized waypoints for directions calculation
-        optimized_coordinates = optimal_result.get('optimal_route_coordinates', [])
+        # Sort results by location index
+        results.sort(key=lambda x: x['location_index'])
         
-        if not optimized_coordinates:
-            return jsonify({
-                'status': 'error',
-                'message': 'No optimized route coordinates returned from matrix calculation',
-                'transport_mode': validated_mode,
-                'api_processing_time_seconds': time.time() - start_total
-            }), 500
-
-        # Convert coordinates to waypoints format for directions API
-        waypoints = [{'lat': coord[0], 'lng': coord[1]} for coord in optimized_coordinates]
-        
-        print(f"Step 2: Getting detailed directions for {len(waypoints)} waypoints...")
-        
-        # Prepare directions request data
-        directions_data = {
-            'waypoints': waypoints,
-            'transport_mode': validated_mode,
-            'optimize_route': False,  # Already optimized by matrix calculation
-            'use_osmnx_fallback': True  # Enable fallback for better reliability
+        # Create response
+        response = {
+            'travel_mode': travel_mode,
+            'travel_times': travel_times,
+            'total_locations': len(locations),
+            'results': results,
+            'total_processing_time_seconds': round(time.time() - start_total, 3)
         }
-
-        # Step 3: Get detailed route directions
-        directions_result = get_route_directions(directions_data)
         
-        if directions_result.get('status') == 'error':
-            # If directions fail, still return the matrix optimization result
-            print(f"Warning: Directions calculation failed, returning matrix result only")
-            enhanced_result = {
-                'status': 'partial_success',
-                'route_type': 'pdp',
-                'transport_mode': validated_mode,
-                'current_location': current_location,
-                'pickup_count': pickup_count,
-                'delivery_count': delivery_count,
-                'total_locations': len(locations),
-                'matrix_calculation': optimal_result,
-                'directions_error': directions_result.get('message', 'Directions calculation failed'),
-                'waypoints': waypoints,
-                'api_processing_time_seconds': time.time() - start_total
-            }
-        else:
-            # Combine matrix optimization with detailed directions
-            enhanced_result = {
-                'status': 'success',
-                'route_type': 'pdp',
-                'transport_mode': validated_mode,
-                'current_location': current_location,
-                'pickup_count': pickup_count,
-                'delivery_count': delivery_count,
-                'total_locations': len(locations),
-                
-                # Matrix calculation results (optimization)
-                'optimization': {
-                    'optimal_route': optimal_result.get('optimal_route', []),
-                    'optimal_route_coordinates': optimal_result.get('optimal_route_coordinates', []),
-                    'minimum_distance_km': optimal_result.get('minimum_distance_km', 0),
-                    'estimated_travel_time_seconds': optimal_result.get('estimated_travel_time_seconds', 0),
-                    'estimated_travel_time': optimal_result.get('estimated_travel_time', '0s')
-                },
-                
-                # Detailed directions results
-                'directions': {
-                    'source': directions_result.get('source', 'unknown'),
-                    'distance': directions_result.get('distance', 0),
-                    'duration': directions_result.get('duration', 0),
-                    'duration_str': directions_result.get('duration_str', '0s'),
-                    'steps': directions_result.get('steps', []),
-                    'geometry': directions_result.get('geometry', []),
-                    'decoded_polyline': directions_result.get('decoded_polyline', []),
-                    'polyline': directions_result.get('polyline', ''),
-                    'waypoints': directions_result.get('waypoints', []),
-                    'metadata': directions_result.get('metadata', {})
-                },
-                
-                'api_processing_time_seconds': time.time() - start_total
-            }
-
-        print(f"\n=== PDP Route Calculation Complete ===")
-        print(f"Status: {enhanced_result.get('status', 'unknown')}")
-        if enhanced_result.get('status') == 'success':
-            print(f"Matrix distance: {enhanced_result.get('optimization', {}).get('minimum_distance_km', 0):.2f} km")
-            print(f"Directions distance: {enhanced_result.get('directions', {}).get('distance', 0):.2f} km")
-            print(f"Matrix travel time: {enhanced_result.get('optimization', {}).get('estimated_travel_time', 'unknown')}")
-            print(f"Directions travel time: {enhanced_result.get('directions', {}).get('duration_str', 'unknown')}")
-            print(f"Steps: {len(enhanced_result.get('directions', {}).get('steps', []))}")
-            print(f"Geometry points: {len(enhanced_result.get('directions', {}).get('geometry', []))}")
-        else:
-            print(f"Matrix distance: {enhanced_result.get('matrix_calculation', {}).get('minimum_distance_km', 0):.2f} km")
-            print(f"Matrix travel time: {enhanced_result.get('matrix_calculation', {}).get('estimated_travel_time', 'unknown')}")
-        print(f"Optimal route length: {len(enhanced_result.get('optimization', enhanced_result.get('matrix_calculation', {})).get('optimal_route', []))}")
-
-        return jsonify(enhanced_result), 200
-
+        # Add summary statistics
+        successful_results = [r for r in results if 'error' not in r]
+        response['summary'] = {
+            'successful_calculations': len(successful_results),
+            'failed_calculations': len(results) - len(successful_results),
+            'average_processing_time': round(
+                sum(r.get('processing_time_seconds', 0) for r in successful_results) / max(len(successful_results), 1),
+                3
+            )
+        }
+        
+        return jsonify(response), 200
+        
     except Exception as e:
-        logging.error(f"PDP Directions API error: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Internal server error: {str(e)}',
-            'route_type': 'pdp',
-            'transport_mode': data.get('transport_mode', 'unknown'),
-            'api_processing_time_seconds': time.time() - start_total
-        }), 500
+        logging.error(f"Batch isochrone API error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
-@directions_routes.route('/simple', methods=['POST'])
-#@jwt_required()
-def calculate_simple_route():
-    """
-    Calculate a simple route between origin and destination
-    Request body: {
-        "origin": {"lat": 41.1230977, "lng": 20.8016481},
-        "destination": {"lat": 41.9981, "lng": 21.4325},
-        "transport_mode": "driving",  // Optional: driving, foot, bike (default: driving)
-        "alternatives": false         // Optional: return alternative routes
-    }
-    """
+@isochrone_routes.route('/cache/status', methods=['GET'])
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='cache_status')
+def get_cache_status():
+    """Get current cache status and statistics"""
     try:
-        start_total = time.time()
-        data = request.get_json()
+        cache_stats = {
+            'memory_cache': {
+                'current_graphs': len(graph_cache.memory_cache),
+                'max_graphs': graph_cache.max_memory_graphs,
+                'cached_keys': list(graph_cache.memory_cache.keys())
+            },
+            'disk_cache': {
+                'cache_folder': graph_cache.cache_folder,
+                'cached_files': []
+            },
+            'background_downloads': {
+                'queue_size': graph_cache.download_queue.qsize(),
+                'downloads_in_progress': len(graph_cache.download_in_progress)
+            }
+        }
         
-        # Validate request
-        required_fields = ['origin', 'destination']
-        if not data or not all(field in data for field in required_fields):
-            return jsonify({
-                'error': 'Invalid request format. Required fields: origin, destination',
-                'example': {
-                    'origin': {'lat': 41.123, 'lng': 20.801},
-                    'destination': {'lat': 41.234, 'lng': 20.902},
-                    'transport_mode': 'driving'  # Optional: driving, foot, bike
-                }
-            }), 400
-        
-        origin = data['origin']
-        destination = data['destination']
-        transport_mode = data.get('transport_mode', 'driving')
-        alternatives = data.get('alternatives', False)
-        
-        # Validate origin and destination structure
-        for field_name, location in [('origin', origin), ('destination', destination)]:
-            if not isinstance(location, dict) or 'lat' not in location or 'lng' not in location:
-                return jsonify({
-                    'error': f'{field_name} must have "lat" and "lng" fields',
-                    'received': location
-                }), 400
-            
-            # Validate coordinate values
-            try:
-                lat = float(location['lat'])
-                lng = float(location['lng'])
-                if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
-                    return jsonify({
-                        'error': f'{field_name} has invalid coordinates. Lat: [-90,90], Lng: [-180,180]',
-                        'received': {'lat': lat, 'lng': lng}
-                    }), 400
-            except (ValueError, TypeError):
-                return jsonify({
-                    'error': f'{field_name} coordinates must be numeric',
-                    'received': location
-                }), 400
-        
-        # Validate transport mode
+        # Get disk cache info
         try:
-            validated_mode = validate_transport_mode(transport_mode)
-        except ValueError as e:
-            return jsonify({
-                'error': str(e),
-                'supported_modes': ['driving', 'foot', 'bike'],
-                'aliases': {
-                    'driving': ['car', 'drive', 'auto'],
-                    'foot': ['walk', 'walking', 'pedestrian'],
-                    'bike': ['cycle', 'cycling', 'bicycle']
-                }
-            }), 400
+            if os.path.exists(graph_cache.cache_folder):
+                cache_files = [f for f in os.listdir(graph_cache.cache_folder) if f.endswith('.graphml')]
+                cache_stats['disk_cache']['cached_files'] = cache_files
+                cache_stats['disk_cache']['total_files'] = len(cache_files)
+        except Exception as e:
+            cache_stats['disk_cache']['error'] = str(e)
         
-        # Get simple route calculation result
-        result = get_simple_route(origin, destination, validated_mode, alternatives)
+        return jsonify(cache_stats), 200
         
-        if result.get('status') == 'error':
-            return jsonify(result), 400
-            
-        # Add API processing time to response
-        result['api_processing_time_seconds'] = time.time() - start_total
+    except Exception as e:
+        logging.error(f"Cache status API error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+@isochrone_routes.route('/cache/clear', methods=['POST'])
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='clear_cache')
+def clear_cache():
+    """Clear cache (memory and/or disk)"""
+    try:
+        data = request.get_json() or {}
+        clear_memory = data.get('clear_memory', True)
+        clear_disk = data.get('clear_disk', False)
+        
+        result = {'cleared': []}
+        
+        if clear_memory:
+            with graph_cache.lock:
+                cleared_count = len(graph_cache.memory_cache)
+                graph_cache.memory_cache.clear()
+                graph_cache.cache_access_times.clear()
+                result['cleared'].append(f'Memory cache ({cleared_count} graphs)')
+        
+        if clear_disk:
+            try:
+                cache_files = [f for f in os.listdir(graph_cache.cache_folder) if f.endswith('.graphml')]
+                for cache_file in cache_files:
+                    os.remove(os.path.join(graph_cache.cache_folder, cache_file))
+                result['cleared'].append(f'Disk cache ({len(cache_files)} files)')
+            except Exception as e:
+                result['disk_clear_error'] = str(e)
+        
         return jsonify(result), 200
         
     except Exception as e:
-        logging.error(f"Simple directions API error: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Internal server error: {str(e)}',
-            'api_processing_time_seconds': time.time() - start_total
-        }), 500
+        logging.error(f"Clear cache API error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
-@directions_routes.route('/modes', methods=['GET'])
-def get_transport_modes():
-    """
-    Get supported transport modes and their configurations
-    """
+@isochrone_routes.route('/preload', methods=['POST'])
+@jwt_required()
+@track_usage(api_id=ISOCHRONE_API_ID, endpoint_name='preload_graphs')
+def preload_graphs():
+    """Preload graphs for specified locations"""
     try:
-        from Services.DirectionsServices import OSRM_SERVERS, DEFAULT_SPEEDS_KPH, OSMNX_NETWORK_TYPES
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Invalid JSON data'}), 400
+        
+        locations = data.get('locations', [])
+        if not locations:
+            return jsonify({'error': 'No locations specified'}), 400
+        
+        if len(locations) > 20:
+            return jsonify({'error': 'Maximum 20 locations allowed for preloading'}), 400
+        
+        travel_modes = data.get('travel_modes', ['drive'])
+        distances = data.get('distances', [2000, 5000])  # meters
+        
+        def preload_location(loc):
+            try:
+                lat, lon = loc['latitude'], loc['longitude']
+                name = loc.get('name', f'{lat},{lon}')
+                
+                for mode in travel_modes:
+                    for distance in distances:
+                        graph_cache.get_graph(lat, lon, distance=distance, network_type=mode)
+                
+                return {'location': name, 'status': 'success'}
+            except Exception as e:
+                return {'location': name, 'status': 'error', 'error': str(e)}
+        
+        # Execute preloading in parallel
+        future_to_location = {
+            executor.submit(preload_location, loc): loc 
+            for loc in locations
+        }
+        
+        results = []
+        for future in as_completed(future_to_location, timeout=300):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                loc = future_to_location[future]
+                results.append({
+                    'location': loc.get('name', f"{loc['latitude']},{loc['longitude']}"),
+                    'status': 'error',
+                    'error': str(e)
+                })
         
         return jsonify({
-            'status': 'success',
-            'supported_modes': list(OSRM_SERVERS.keys()),
-            'mode_details': {
-                mode: {
-                    'osrm_server': server,
-                    'default_speed_kph': DEFAULT_SPEEDS_KPH.get(mode, 0),
-                    'osmnx_network_type': OSMNX_NETWORK_TYPES.get(mode, 'unknown')
-                }
-                for mode, server in OSRM_SERVERS.items()
-            },
-            'aliases': {
-                'driving': ['car', 'drive', 'auto'],
-                'foot': ['walk', 'walking', 'pedestrian'],
-                'bike': ['cycle', 'cycling', 'bicycle']
-            }
+            'preload_results': results,
+            'successful': len([r for r in results if r['status'] == 'success']),
+            'failed': len([r for r in results if r['status'] == 'error'])
         }), 200
+        
     except Exception as e:
-        logging.error(f"Transport modes endpoint error: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'error',
-            'message': f'Internal server error: {str(e)}'
-        }), 500
+        logging.error(f"Preload API error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
-@directions_routes.route('/health', methods=['GET'])
-def health_check():
-    """
-    Health check endpoint for directions service
-    """
+# Initialize preloading on startup (call this when your app starts)
+def initialize_cache():
+    """Initialize cache with popular locations"""
     try:
-        return jsonify({
-            'status': 'healthy',
-            'service': 'directions',
-            'timestamp': time.time(),
-            'endpoints': {
-                'POST /route': 'Calculate route with multiple waypoints',
-                'POST /route_pdp': 'Calculate optimized route for Pickup Delivery Problem',
-                'POST /simple': 'Calculate simple route between two points',
-                'GET /modes': 'Get supported transport modes',
-                'GET /health': 'Health check'
-            }
-        }), 200
+        preload_popular_areas()
+        cleanup_old_cache(max_age_days=30)
+        logger.info("Cache initialization completed")
     except Exception as e:
-        logging.error(f"Directions health check error: {str(e)}", exc_info=True)
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e)
-        }), 500
+        logger.error(f"Cache initialization error: {e}")
+
+# Call this in your main app initialization
+# initialize_cache()

@@ -15,6 +15,7 @@ db_host = config_secrets.DB_HOST
 db_port = config_secrets.DB_PORT
 db_name = config_secrets.DB_NAME
 
+
 app.config['SQLALCHEMY_DATABASE_URI'] = (
     f'mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}'
 )
