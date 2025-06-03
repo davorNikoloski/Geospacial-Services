@@ -229,33 +229,55 @@ class UsageCRUD:
 
     @staticmethod
     def get_usage_analytics_summary(user_id=None, api_id=None):
-        """Get summary statistics for analytics data"""
+        """Get summary statistics for analytics data including totals and averages"""
         try:
-            query = db.session.query(
-                func.count(ApiAnalytics.id).label('total_requests'),
-                func.avg(ApiAnalytics.distance_meters).label('avg_distance'),
-                func.avg(ApiAnalytics.duration_seconds).label('avg_duration'),
-                func.max(ApiAnalytics.distance_meters).label('max_distance'),
-                func.max(ApiAnalytics.duration_seconds).label('max_duration')
-            )
-
+            # Build base query with filters
+            query = db.session.query(ApiAnalytics)
+            
             if user_id:
-                query = query.filter_by(user_id=user_id)
+                query = query.filter(ApiAnalytics.user_id == user_id)
             if api_id:
-                query = query.filter_by(api_id=api_id)
+                query = query.filter(ApiAnalytics.api_id == api_id)
 
-            result = query.first()
+            # Execute aggregation query
+            result = query.with_entities(
+                func.count(ApiAnalytics.id).label('total_requests'),
+                func.coalesce(func.sum(ApiAnalytics.distance_meters), 0).label('total_distance'),
+                func.coalesce(func.sum(ApiAnalytics.duration_seconds), 0).label('total_duration'),
+                func.coalesce(func.avg(ApiAnalytics.distance_meters), 0).label('avg_distance'),
+                func.coalesce(func.avg(ApiAnalytics.duration_seconds), 0).label('avg_duration'),
+                func.coalesce(func.max(ApiAnalytics.distance_meters), 0).label('max_distance'),
+                func.coalesce(func.max(ApiAnalytics.duration_seconds), 0).label('max_duration')
+            ).first()
+
+            # Handle case where no results are found
+            if not result or result.total_requests == 0:
+                return {
+                    'total_requests': 0,
+                    'total_distance': 0,
+                    'total_duration': 0,
+                    'avg_distance': 0,
+                    'avg_duration': 0,
+                    'max_distance': 0,
+                    'max_duration': 0
+                }
+
             return {
-                'total_requests': result.total_requests or 0,
-                'avg_distance': float(result.avg_distance) if result.avg_distance else 0,
-                'avg_duration': float(result.avg_duration) if result.avg_duration else 0,
-                'max_distance': result.max_distance or 0,
-                'max_duration': result.max_duration or 0
+                'total_requests': result.total_requests,
+                'total_distance': float(result.total_distance),
+                'total_duration': float(result.total_duration),
+                'avg_distance': float(result.avg_distance),
+                'avg_duration': float(result.avg_duration),
+                'max_distance': float(result.max_distance) if result.max_distance else 0,
+                'max_duration': float(result.max_duration) if result.max_duration else 0
             }
+            
         except SQLAlchemyError as e:
             logger.error(f"Error getting analytics summary: {str(e)}", exc_info=True)
             raise
-
+        except Exception as e:
+            logger.error(f"Unexpected error in get_usage_analytics_summary: {str(e)}", exc_info=True)
+            raise
 
     @staticmethod
     def get_user_api_usage_summary(user_id):
@@ -300,4 +322,67 @@ class UsageCRUD:
             return query.all()
         except SQLAlchemyError as e:
             logger.error(f"Error getting route type distribution: {str(e)}", exc_info=True)
+            raise
+
+    @staticmethod
+    def get_detailed_analytics_summary(user_id=None, api_id=None, time_range=None):
+        """
+        Get detailed analytics summary with additional metrics
+        """
+        try:
+            query = db.session.query(ApiAnalytics)
+            
+            # Apply filters
+            filters = []
+            if user_id:
+                filters.append(ApiAnalytics.user_id == user_id)
+            if api_id:
+                filters.append(ApiAnalytics.api_id == api_id)
+            if time_range:
+                start_date, end_date = time_range
+                filters.append(ApiAnalytics.timestamp.between(start_date, end_date))
+
+            if filters:
+                query = query.filter(and_(*filters))
+
+            # Get aggregated results
+            result = query.with_entities(
+                func.count(ApiAnalytics.id).label('total_requests'),
+                func.coalesce(func.sum(ApiAnalytics.distance_meters), 0).label('total_distance'),
+                func.coalesce(func.sum(ApiAnalytics.duration_seconds), 0).label('total_duration'),
+                func.coalesce(func.avg(ApiAnalytics.distance_meters), 0).label('avg_distance'),
+                func.coalesce(func.avg(ApiAnalytics.duration_seconds), 0).label('avg_duration'),
+                func.coalesce(func.min(ApiAnalytics.distance_meters), 0).label('min_distance'),
+                func.coalesce(func.min(ApiAnalytics.duration_seconds), 0).label('min_duration'),
+                func.coalesce(func.max(ApiAnalytics.distance_meters), 0).label('max_distance'),
+                func.coalesce(func.max(ApiAnalytics.duration_seconds), 0).label('max_duration')
+            ).first()
+
+            if not result or result.total_requests == 0:
+                return {
+                    'total_requests': 0,
+                    'total_distance': 0,
+                    'total_duration': 0,
+                    'avg_distance': 0,
+                    'avg_duration': 0,
+                    'min_distance': 0,
+                    'min_duration': 0,
+                    'max_distance': 0,
+                    'max_duration': 0
+                }
+
+            return {
+                'total_requests': result.total_requests,
+                'total_distance': float(result.total_distance),
+                'total_duration': float(result.total_duration),
+                'avg_distance': float(result.avg_distance),
+                'avg_duration': float(result.avg_duration),
+                'min_distance': float(result.min_distance) if result.min_distance else 0,
+                'min_duration': float(result.min_duration) if result.min_duration else 0,
+                'max_distance': float(result.max_distance) if result.max_distance else 0,
+                'max_duration': float(result.max_duration) if result.max_duration else 0
+            }
+
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting detailed analytics summary: {str(e)}", exc_info=True)
             raise

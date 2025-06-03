@@ -101,6 +101,40 @@ def login():
         logger.error(f"Login error: {str(e)}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
+@user_api.route('/me', methods=['GET'])
+@jwt_required()
+def get_current_user():
+    """Get current authenticated user's details"""
+    try:
+        # Get user ID from JWT token
+        user_id = get_jwt_identity()
+        if not user_id:
+            logger.warning("No user ID found in JWT token")
+            return jsonify({'error': 'Invalid token'}), 401
+
+        # Get user by ID
+        user = UserCRUD.get_user_by_id(user_id)
+        if not user:
+            logger.warning(f"User not found for ID: {user_id}")
+            return jsonify({'error': 'User not found'}), 404
+
+        logger.info(f"User {user.username} (ID: {user.id}) fetched profile successfully")
+
+        return jsonify({
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'firstname': user.firstname,
+                'lastname': user.lastname,
+                'is_admin': user.is_admin
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error fetching user profile: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+    
 @user_api.route('/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def refresh():

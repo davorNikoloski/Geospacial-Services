@@ -15,7 +15,6 @@ db_host = config_secrets.DB_HOST
 db_port = config_secrets.DB_PORT
 db_name = config_secrets.DB_NAME
 
-
 app.config['SQLALCHEMY_DATABASE_URI'] = (
     f'mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}'
 )
@@ -25,6 +24,7 @@ app.config["SQLALCHEMY_EXTEND_EXISTING"] = True
 app.config["ALLOWED_IMAGE_EXTENSIONS"] = ["PNG", "JPG", "GIF", "JPEG"]
 app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 * 1024  # 64 MB
 app.config["JWT_SECRET_KEY"] = config_secrets.SECRET_KEY
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = False  # Add this line
 app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif'}
 app.config["UPLOAD_FOLDER"] = os.path.join(app.root_path, 'static', 'images')
 app.config["CACHE_FOLDER"] = os.path.join(app.root_path, 'static', 'cache')
@@ -40,7 +40,14 @@ for folder in [app.config["UPLOAD_FOLDER"], app.config["CACHE_FOLDER"]]:
             print(f"Could not create directory: {folder}, Error: {e}")
 
 # Init extensions
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:4200"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True
+    }
+})
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)

@@ -86,7 +86,7 @@ def get_user_api_keys(user_id):
         response = [{
             'id': key.id,
             'user_id': key.user_id,
-            'api_key': key.api_key[:8] + '...',
+            'api_key': key.api_key,
             'name': key.name,
             'created_at': key.created_at.isoformat(),
             'expires_at': key.expires_at.isoformat() if key.expires_at else None,

@@ -7,6 +7,7 @@ import time
 import threading
 import os
 import faulthandler
+from flask_cors import CORS  # Add this import
 from Routes.userRoutes import user_api
 from Routes.apiKeyRoutes import api_key_api
 from Routes.apiRoutes import api_management_api
@@ -43,6 +44,16 @@ logging.getLogger().addHandler(console_handler)
 def create_app():
     app = Flask(__name__)
     
+    # Configure CORS - Add this section
+    CORS(app, resources={
+        r"/api/*": {
+            "origins": ["http://localhost:4200"],
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+            "supports_credentials": True
+        }
+    })
+    
     # Configure database
     db_password = quote_plus(config_secrets.DB_PASSWORD)
     db_user = config_secrets.DB_USER
@@ -51,7 +62,7 @@ def create_app():
     db_name = config_secrets.DB_NAME
 
     app.config['SQLALCHEMY_DATABASE_URI'] = (
-    f'mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}')
+        f'mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}')
     
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -60,6 +71,7 @@ def create_app():
 
     #JWT
     app.config["JWT_SECRET_KEY"] = config_secrets.SECRET_KEY
+    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = False  # Add this line
 
     jwt = JWTManager(app)
 
@@ -68,19 +80,34 @@ def create_app():
     def log_request_info():
         g.start_time = time.time()
         app.logger.info(f"Request: {request.method} {request.url} Headers: {dict(request.headers)}")
+        if request.method == "OPTIONS":
+            return jsonify({"status": "ok"}), 200
 
     @app.after_request
     def log_response_info(response):
         duration = time.time() - g.start_time
         memory_usage = psutil.Process().memory_info().rss / 1024 ** 2
         app.logger.info(f"Response: {request.method} {request.url} Status: {response.status} Duration: {duration:.3f}s Memory: {memory_usage:.2f}MB")
+        
+        # Add CORS headers to every response
+        response.headers.add('Access-Control-Allow-Origin', 'http://localhost:4200')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+        response.headers.add('Access-Control-Allow-Credentials', 'true')
         return response
 
     # === ERROR HANDLING ===
     @app.errorhandler(Exception)
     def handle_exception(e):
         app.logger.error(f"Unhandled Exception: {str(e)}", exc_info=True)
-        return jsonify(error="Internal Server Error"), 500
+        response = jsonify(error="Internal Server Error")
+        response.status_code = 500
+        # Add CORS headers to error responses
+        response.headers.add('Access-Control-Allow-Origin', 'http://localhost:4200')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+        response.headers.add('Access-Control-Allow-Credentials', 'true')
+        return response
 
     # === PERIODIC MEMORY LOGGER ===
     def log_memory_usage(interval=60):
@@ -92,7 +119,7 @@ def create_app():
 
     threading.Thread(target=log_memory_usage, daemon=True).start()
 
-    
+    # Register blueprints
     app.register_blueprint(user_api)
     app.register_blueprint(api_key_api)
     app.register_blueprint(api_management_api)
